@@ -67,7 +67,6 @@ ts_chunk_dispatch_get_chunk_insert_state(ChunkDispatch *dispatch, Point *point,
 {
 	ChunkInsertState *cis;
 	bool cis_changed = true;
-	bool found = true;
 	Chunk *chunk = NULL;
 
 	/* Direct inserts into internal compressed hypertable is not supported.
@@ -137,11 +136,31 @@ ts_chunk_dispatch_get_chunk_insert_state(ChunkDispatch *dispatch, Point *point,
 
 		if (!chunk)
 		{
-			chunk = ts_hypertable_create_chunk_for_point(dispatch->hypertable, point, &found);
+			chunk = ts_hypertable_create_chunk_for_point(dispatch->hypertable, point);
 		}
 
 		if (!chunk)
 			elog(ERROR, "no chunk found or created");
+
+		if (dispatch->create_compressed_chunk && !chunk->fd.compressed_chunk_id)
+		{
+			/*
+			 * When we try to create a compressed chunk, we need to grab a lock on the
+			 * chunk to synchronize with other concurrent insert operations trying to
+			 * create the same compressed chunk.
+			 */
+			LockRelationOid(chunk->table_id, ShareUpdateExclusiveLock);
+			chunk = ts_chunk_get_by_id(chunk->fd.id, CACHE_FLAG_NONE);
+			/* recheck whether compressed chunk exists after acquiring the lock */
+			if (!chunk->fd.compressed_chunk_id)
+			{
+				Hypertable *compressed_ht =
+					ts_hypertable_get_by_id(dispatch->hypertable->fd.compressed_hypertable_id);
+				Chunk *compressed_chunk =
+					ts_cm_functions->compression_chunk_create(compressed_ht, chunk);
+				ts_chunk_set_compressed_chunk(chunk, compressed_chunk->fd.id);
+			}
+		}
 
 		cis = ts_chunk_insert_state_create(chunk->table_id, dispatch);
 		ts_subspace_store_add(dispatch->cache, chunk->cube, cis, destroy_chunk_insert_state);

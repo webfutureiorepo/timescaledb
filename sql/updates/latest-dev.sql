@@ -40,3 +40,18 @@ BEGIN
   -- empty body
 END;
 $$ LANGUAGE PLPGSQL;
+
+DROP PROCEDURE @extschema@.refresh_continuous_aggregate(
+    continuous_aggregate REGCLASS,
+    window_start "any",
+    window_end "any",
+    force BOOLEAN
+);
+
+CREATE PROCEDURE @extschema@.refresh_continuous_aggregate(
+    continuous_aggregate     REGCLASS,
+    window_start             "any",
+    window_end               "any",
+    force                    BOOLEAN = FALSE,
+    options                  JSONB = NULL
+) LANGUAGE C AS '@MODULE_PATHNAME@', 'ts_update_placeholder';

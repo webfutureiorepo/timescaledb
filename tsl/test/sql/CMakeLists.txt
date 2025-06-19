@@ -91,12 +91,17 @@ set(TEST_TEMPLATES
     cagg_union_view.sql.in
     cagg_permissions.sql.in
     compression_permissions.sql.in
+    ordered_append.sql.in
     plan_skip_scan.sql.in
     transparent_decompression.sql.in
     transparent_decompression_ordered_index.sql.in)
 
 if(USE_TELEMETRY)
   list(APPEND TEST_FILES bgw_telemetry.sql)
+endif()
+
+if(NOT APPLE)
+  list(APPEND TEST_FILES compressed_copy.sql)
 endif()
 
 if(CMAKE_BUILD_TYPE MATCHES Debug)
@@ -113,7 +118,7 @@ if(CMAKE_BUILD_TYPE MATCHES Debug)
     bgw_scheduler_restart.sql
     bgw_reorder_drop_chunks.sql
     scheduler_fixed.sql
-    cagg_refresh_policy_incremental.sql
+    cagg_policy_incremental.sql
     compress_bgw_reorder_drop_chunks.sql
     chunk_api.sql
     chunk_merge.sql
@@ -220,7 +225,7 @@ set(SOLO_TESTS
     cagg_ddl-${PG_VERSION_MAJOR}
     cagg_dump
     cagg_invalidation
-    cagg_refresh_policy_incremental
+    cagg_policy_incremental
     hypercore
     move
     reorder

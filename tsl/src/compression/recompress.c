@@ -324,7 +324,7 @@ recompress_chunk_segmentwise_impl(Chunk *uncompressed_chunk)
 
 	HeapTuple compressed_tuple;
 	IndexScanDesc index_scan =
-		index_beginscan(compressed_chunk_rel, index_rel, snapshot, num_segmentby, 0);
+		index_beginscan_compat(compressed_chunk_rel, index_rel, snapshot, NULL, num_segmentby, 0);
 
 	bool found_tuple = fetch_uncompressed_chunk_into_tuplesort(input_tuplesortstate,
 															   uncompressed_chunk_rel,
@@ -716,11 +716,7 @@ recompress_segment(Tuplesortstate *tuplesortstate, Relation compressed_chunk_rel
 {
 	tuplesort_performsort(tuplesortstate);
 	row_compressor_reset(row_compressor);
-	row_compressor_append_sorted_rows(row_compressor,
-									  tuplesortstate,
-									  RelationGetDescr(compressed_chunk_rel),
-									  compressed_chunk_rel,
-									  writer);
+	row_compressor_append_sorted_rows(row_compressor, tuplesortstate, compressed_chunk_rel, writer);
 	tuplesort_reset(tuplesortstate);
 	CommandCounterIncrement();
 }

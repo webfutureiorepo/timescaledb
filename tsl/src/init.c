@@ -27,10 +27,10 @@
 #include "compression/create.h"
 #include "compression/recompress.h"
 #include "compression/sparse_index_bloom1.h"
-#include "config.h"
 #include "continuous_aggs/create.h"
 #include "continuous_aggs/insert.h"
 #include "continuous_aggs/invalidation.h"
+#include "continuous_aggs/invalidation_record.h"
 #include "continuous_aggs/options.h"
 #include "continuous_aggs/refresh.h"
 #include "continuous_aggs/repair.h"
@@ -42,7 +42,6 @@
 #include "hypercore/attr_capture.h"
 #include "hypercore/hypercore_handler.h"
 #include "hypercore/hypercore_proxy.h"
-#include "hypertable.h"
 #include "license_guc.h"
 #include "nodes/columnar_scan/columnar_scan.h"
 #include "nodes/decompress_chunk/planner.h"
@@ -157,6 +156,7 @@ CrossModuleFunctions tsl_cm_functions = {
 	.continuous_agg_get_bucket_function = continuous_agg_get_bucket_function,
 	.continuous_agg_get_bucket_function_info = continuous_agg_get_bucket_function_info,
 	.continuous_agg_migrate_to_time_bucket = continuous_agg_migrate_to_time_bucket,
+	.continuous_agg_read_invalidation_record = ts_invalidation_read_record,
 	.cagg_try_repair = tsl_cagg_try_repair,
 
 	/* Compression */
@@ -192,6 +192,11 @@ CrossModuleFunctions tsl_cm_functions = {
 	.hypercore_decompress_update_segment = hypercore_decompress_update_segment,
 	.is_compressed_tid = tsl_is_compressed_tid,
 	.compression_enable = tsl_compression_enable,
+	.compressor_init = tsl_compressor_init,
+	.compressor_add_slot = tsl_compressor_add_slot,
+	.compressor_flush = tsl_compressor_flush,
+	.compressor_free = tsl_compressor_free,
+	.compression_chunk_create = tsl_compression_chunk_create,
 	.ddl_command_start = tsl_ddl_command_start,
 	.ddl_command_end = tsl_ddl_command_end,
 	.show_chunk = chunk_show,
@@ -205,6 +210,8 @@ CrossModuleFunctions tsl_cm_functions = {
 	.preprocess_query_tsl = tsl_preprocess_query,
 	.merge_chunks = chunk_merge_chunks,
 	.split_chunk = chunk_split_chunk,
+	.detach_chunk = chunk_detach,
+	.attach_chunk = chunk_attach,
 };
 
 static void

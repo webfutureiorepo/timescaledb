@@ -34,7 +34,7 @@ typedef struct PolicyRetentionData
 {
 	Oid object_relid;
 	Datum boundary;
-	Datum boundary_type;
+	Oid boundary_type;
 	bool use_creation_time;
 } PolicyRetentionData;
 
@@ -47,6 +47,7 @@ typedef struct PolicyContinuousAggData
 	int32 buckets_per_batch;
 	int32 max_batches_per_execution;
 	bool refresh_newest_first;
+	bool process_hypertable_invalidations;
 } PolicyContinuousAggData;
 
 typedef struct PolicyCompressionData

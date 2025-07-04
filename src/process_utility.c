@@ -1308,7 +1308,11 @@ process_truncate(ProcessUtilityArgs *args)
 						 * Block direct TRUNCATE on frozen chunk.
 						 */
 						if (ts_chunk_is_frozen(chunk))
-							elog(ERROR, "cannot TRUNCATE frozen chunk \"%s\"", get_rel_name(relid));
+							ereport(ERROR,
+									(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									 errmsg("cannot TRUNCATE frozen chunk \"%s\"",
+											get_rel_name(relid)),
+									 errhint("Unfreeze the chunk to TRUNCATE it.")));
 
 						Assert(ht != NULL);
 
@@ -3658,7 +3662,12 @@ process_cluster_start(ProcessUtilityArgs *args)
 			 * Since we keep OIDs between transactions, there is a potential
 			 * issue if an OID gets reassigned between two subtransactions
 			 */
+#if PG18_LT
 			cluster_rel(cim->chunkoid, cim->indexoid, get_cluster_options(stmt));
+#else
+			Relation rel = table_open(cim->chunkoid, AccessExclusiveLock);
+			cluster_rel(rel, cim->indexoid, get_cluster_options(stmt));
+#endif
 			PopActiveSnapshot();
 			CommitTransactionCommand();
 		}
@@ -4997,7 +5006,8 @@ process_viewstmt(ProcessUtilityArgs *args)
 	ts_with_clause_filter(stmt->options, &cagg_options, &pg_options);
 	if (cagg_options)
 		ereport(ERROR,
-				(errmsg("cannot create continuous aggregate with CREATE VIEW"),
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot create continuous aggregate with CREATE VIEW"),
 				 errhint("Use CREATE MATERIALIZED VIEW to create a continuous aggregate.")));
 	return DDL_CONTINUE;
 }

@@ -3,6 +3,7 @@ DROP PROCEDURE @extschema@.add_process_hypertable_invalidations_policy(REGCLASS,
 DROP PROCEDURE @extschema@.remove_process_hypertable_invalidations_policy(REGCLASS, BOOL);
 DROP PROCEDURE _timescaledb_functions.policy_process_hypertable_invalidations(INTEGER, JSONB);
 DROP FUNCTION _timescaledb_functions.policy_process_hypertable_invalidations_check(JSONB);
+DROP FUNCTION _timescaledb_functions.cagg_parse_invalidation_record(BYTEA);
 
 DROP PROCEDURE IF EXISTS _timescaledb_functions.policy_compression(job_id INTEGER, config JSONB);
 DROP PROCEDURE IF EXISTS _timescaledb_functions.policy_compression_execute(
@@ -23,3 +24,21 @@ BEGIN
   -- empty body
 END;
 $$ LANGUAGE PLPGSQL;
+
+DROP PROCEDURE @extschema@.refresh_continuous_aggregate(
+    continuous_aggregate REGCLASS,
+    window_start "any",
+    window_end "any",
+    force BOOLEAN,
+    options JSONB
+);
+
+CREATE PROCEDURE @extschema@.refresh_continuous_aggregate(
+    continuous_aggregate     REGCLASS,
+    window_start             "any",
+    window_end               "any",
+    force                    BOOLEAN = FALSE
+) LANGUAGE C AS '@MODULE_PATHNAME@', 'ts_update_placeholder';
+
+DROP PROCEDURE IF EXISTS @extschema@.detach_chunk(REGCLASS);
+DROP PROCEDURE IF EXISTS @extschema@.attach_chunk(REGCLASS, REGCLASS, JSONB);

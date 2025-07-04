@@ -5,6 +5,8 @@
  */
 #include <postgres.h>
 
+#include "bgw/job.h"
+#include "bgw_policy/policies_v2.h"
 #include <access/xact.h>
 #include <executor/spi.h>
 #include <fmgr.h>
@@ -24,6 +26,7 @@
 #include "hypertable.h"
 #include "invalidation.h"
 #include "invalidation_threshold.h"
+#include "jsonb_utils.h"
 #include "materialize.h"
 #include "process_utility.h"
 #include "refresh.h"
@@ -433,23 +436,13 @@ static void
 log_refresh_window(int elevel, const ContinuousAgg *cagg, const InternalTimeRange *refresh_window,
 				   const char *msg, CaggRefreshContext context)
 {
-	Datum start_ts;
-	Datum end_ts;
-	Oid outfuncid = InvalidOid;
-	bool isvarlena;
-
-	start_ts = ts_internal_to_time_value(refresh_window->start, refresh_window->type);
-	end_ts = ts_internal_to_time_value(refresh_window->end, refresh_window->type);
-	getTypeOutputInfo(refresh_window->type, &outfuncid, &isvarlena);
-	Assert(!isvarlena);
-
 	if (context.callctx == CAGG_REFRESH_POLICY_BATCHED)
 		elog(elevel,
 			 "%s \"%s\" in window [ %s, %s ] (batch %d of %d)",
 			 msg,
 			 NameStr(cagg->data.user_view_name),
-			 DatumGetCString(OidFunctionCall1(outfuncid, start_ts)),
-			 DatumGetCString(OidFunctionCall1(outfuncid, end_ts)),
+			 ts_internal_to_time_string(refresh_window->start, refresh_window->type),
+			 ts_internal_to_time_string(refresh_window->end, refresh_window->type),
 			 context.processing_batch,
 			 context.number_of_batches);
 	else
@@ -457,8 +450,8 @@ log_refresh_window(int elevel, const ContinuousAgg *cagg, const InternalTimeRang
 			 "%s \"%s\" in window [ %s, %s ]",
 			 msg,
 			 NameStr(cagg->data.user_view_name),
-			 DatumGetCString(OidFunctionCall1(outfuncid, start_ts)),
-			 DatumGetCString(OidFunctionCall1(outfuncid, end_ts)));
+			 ts_internal_to_time_string(refresh_window->start, refresh_window->type),
+			 ts_internal_to_time_string(refresh_window->end, refresh_window->type));
 }
 
 typedef void (*scan_refresh_ranges_funct_t)(const InternalTimeRange *bucketed_refresh_window,
@@ -644,12 +637,23 @@ continuous_agg_refresh(PG_FUNCTION_ARGS)
 {
 	Oid cagg_relid = PG_ARGISNULL(0) ? InvalidOid : PG_GETARG_OID(0);
 	bool force = PG_ARGISNULL(3) ? false : PG_GETARG_BOOL(3);
+	Jsonb *options = PG_ARGISNULL(4) ? NULL : PG_GETARG_JSONB_P(4);
+	bool process_hypertable_invalidations = true;
 	ContinuousAgg *cagg;
 	InternalTimeRange refresh_window = {
 		.type = InvalidOid,
 	};
 
 	ts_feature_flag_check(FEATURE_CAGG);
+
+	if (options)
+	{
+		bool found;
+		bool value = ts_jsonb_get_bool_field(options,
+											 POL_REFRESH_CONF_KEY_PROCESS_HYPERTABLE_INVALIDATIONS,
+											 &found);
+		process_hypertable_invalidations = !found || value;
+	}
 
 	cagg = cagg_get_by_relid_or_fail(cagg_relid);
 	refresh_window.type = cagg->partition_type;
@@ -677,7 +681,10 @@ continuous_agg_refresh(PG_FUNCTION_ARGS)
 									context,
 									PG_ARGISNULL(1),
 									PG_ARGISNULL(2),
-									force);
+									true,
+									force,
+									process_hypertable_invalidations,
+									false /*extend_last_bucket*/);
 
 	PG_RETURN_VOID();
 }
@@ -737,7 +744,7 @@ process_cagg_invalidations_and_refresh(const ContinuousAgg *cagg,
 	 * same continuous aggregate when they don't have overlapping refresh
 	 * windows.
 	 */
-	LockRelationOid(hyper_relid, ExclusiveLock);
+	LockRelationOid(hyper_relid, RowExclusiveLock);
 	invalidations = invalidation_process_cagg_log(cagg,
 												  refresh_window,
 												  ts_guc_cagg_max_individual_materializations,
@@ -776,7 +783,8 @@ void
 continuous_agg_refresh_internal(const ContinuousAgg *cagg,
 								const InternalTimeRange *refresh_window_arg,
 								const CaggRefreshContext context, const bool start_isnull,
-								const bool end_isnull, bool force)
+								const bool end_isnull, bool bucketing_refresh_window, bool force,
+								bool process_hypertable_invalidations, bool extend_last_bucket)
 {
 	int32 mat_id = cagg->data.mat_hypertable_id;
 	InternalTimeRange refresh_window = *refresh_window_arg;
@@ -827,7 +835,7 @@ continuous_agg_refresh_internal(const ContinuousAgg *cagg,
 					   get_rel_name(cagg->relid));
 
 	/* No bucketing when open ended */
-	if (!(start_isnull && end_isnull))
+	if (bucketing_refresh_window && !(start_isnull && end_isnull))
 	{
 		if (cagg->bucket_function->bucket_fixed_interval == false)
 		{
@@ -852,6 +860,30 @@ continuous_agg_refresh_internal(const ContinuousAgg *cagg,
 				 errdetail("The refresh window must cover at least one bucket of data."),
 				 errhint("Align the refresh window with the bucket"
 						 " time zone or use at least two buckets.")));
+
+	/* If there is no other policy defined after this, the inscribed bucket calculated above
+	 * is correct. However, in the case of concurrent policies, if this isn't the last
+	 * policy defined then we should extend the end of the window to include the partial
+	 * bucket. This is done to ensure concurrent policies that are 'adjacent' don't skip a
+	 * bucket We don't need to do this when the CAgg is created WITH DATA, or manually
+	 * refreshed
+	 */
+	if (extend_last_bucket && !(start_isnull && end_isnull))
+	{
+		if (cagg->bucket_function->bucket_fixed_interval == false)
+		{
+			refresh_window.end =
+				ts_compute_beginning_of_the_next_bucket_variable(refresh_window.end,
+																 cagg->bucket_function);
+		}
+		else
+		{
+			int64 bucket_width = ts_continuous_agg_fixed_bucket_width(cagg->bucket_function);
+			refresh_window.end =
+				ts_time_saturating_add(refresh_window.end, bucket_width - 1, refresh_window.type);
+		}
+	}
+
 	/*
 	 * Perform the refresh across two transactions.
 	 *
@@ -906,7 +938,8 @@ continuous_agg_refresh_internal(const ContinuousAgg *cagg,
 		return;
 	}
 
-	invalidation_process_hypertable_log(cagg->data.raw_hypertable_id, refresh_window.type);
+	if (process_hypertable_invalidations)
+		invalidation_process_hypertable_log(cagg->data.raw_hypertable_id, refresh_window.type);
 
 	/* Commit and Start a new transaction */
 	SPI_commit_and_chain();
@@ -937,27 +970,17 @@ static void
 debug_refresh_window(const ContinuousAgg *cagg, const InternalTimeRange *refresh_window,
 					 const char *msg)
 {
-	Datum start_ts;
-	Datum end_ts;
-	Oid outfuncid = InvalidOid;
-	bool isvarlena;
-
-	start_ts = ts_internal_to_time_value(refresh_window->start, refresh_window->type);
-	end_ts = ts_internal_to_time_value(refresh_window->end, refresh_window->type);
-	getTypeOutputInfo(refresh_window->type, &outfuncid, &isvarlena);
-	Assert(!isvarlena);
-
 	elog(DEBUG1,
 		 "%s \"%s\" in window [ %s, %s ] internal [ " INT64_FORMAT ", " INT64_FORMAT
 		 " ] minimum [ %s ]",
 		 msg,
 		 NameStr(cagg->data.user_view_name),
-		 DatumGetCString(OidFunctionCall1(outfuncid, start_ts)),
-		 DatumGetCString(OidFunctionCall1(outfuncid, end_ts)),
+		 ts_internal_to_time_string(refresh_window->start, refresh_window->type),
+		 ts_internal_to_time_string(refresh_window->end, refresh_window->type),
 		 refresh_window->start,
 		 refresh_window->end,
-		 DatumGetCString(
-			 OidFunctionCall1(outfuncid, Int64GetDatum(ts_time_get_min(refresh_window->type)))));
+		 ts_datum_to_string(Int64GetDatum(ts_time_get_min(refresh_window->type)),
+							refresh_window->type));
 }
 
 List *
@@ -1054,18 +1077,12 @@ continuous_agg_split_refresh_window(ContinuousAgg *cagg, InternalTimeRange *orig
 		Oid type = IS_TIMESTAMP_TYPE(refresh_window.type) ? INTERVALOID : refresh_window.type;
 		Datum refresh_size_interval = ts_internal_to_interval_value(refresh_window_size, type);
 		Datum batch_size_interval = ts_internal_to_interval_value(batch_size, type);
-		Oid typoutputfunc;
-		bool isvarlena;
-		FmgrInfo typoutputinfo;
-
-		getTypeOutputInfo(type, &typoutputfunc, &isvarlena);
-		fmgr_info(typoutputfunc, &typoutputinfo);
 
 		elog(LOG,
 			 "refresh window size (%s) is smaller than or equal to batch size (%s), falling back "
 			 "to single batch processing",
-			 OutputFunctionCall(&typoutputinfo, refresh_size_interval),
-			 OutputFunctionCall(&typoutputinfo, batch_size_interval));
+			 ts_datum_to_string(refresh_size_interval, type),
+			 ts_datum_to_string(batch_size_interval, type));
 		return NIL;
 	}
 
@@ -1145,7 +1162,7 @@ continuous_agg_split_refresh_window(ContinuousAgg *cagg, InternalTimeRange *orig
 					OPERATOR(pg_catalog.&&) \
 					pg_catalog.int8range(lowest_modified_value, greatest_modified_value) \
 					AND lowest_modified_value IS NOT NULL \
-					AND (greatest_modified_value IS NOT NULL AND greatest_modified_value != -210866803200000001) \
+					AND (greatest_modified_value IS NOT NULL AND greatest_modified_value != $7) \
 			) \
 		ORDER BY \
 			refresh_start %s;";
@@ -1159,14 +1176,15 @@ continuous_agg_split_refresh_window(ContinuousAgg *cagg, InternalTimeRange *orig
 
 	/* Prepare for SPI call */
 	int res;
-	Oid types[] = { INT4OID, INT4OID, INT4OID, INT8OID, INT8OID, INT8OID };
+	Oid types[] = { INT4OID, INT4OID, INT4OID, INT8OID, INT8OID, INT8OID, INT8OID };
 	Datum values[] = { Int32GetDatum(ht->fd.id),
 					   Int32GetDatum(time_dim->fd.id),
 					   Int32GetDatum(cagg->data.mat_hypertable_id),
 					   Int64GetDatum(batch_size),
 					   Int64GetDatum(refresh_window.start),
-					   Int64GetDatum(refresh_window.end) };
-	char nulls[] = { false, false, false, false, false, false };
+					   Int64GetDatum(refresh_window.end),
+					   Int64GetDatum(CAGG_INVALIDATION_WRONG_GREATEST_VALUE) };
+	char nulls[] = { false, false, false, false, false, false, false };
 	MemoryContext oldcontext = CurrentMemoryContext;
 
 	if (SPI_connect() != SPI_OK_CONNECT)
@@ -1177,7 +1195,7 @@ continuous_agg_split_refresh_window(ContinuousAgg *cagg, InternalTimeRange *orig
 	RestrictSearchPath();
 
 	res = SPI_execute_with_args(query_str,
-								6,
+								7,
 								types,
 								values,
 								nulls,

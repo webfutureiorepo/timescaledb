@@ -5,6 +5,7 @@
  */
 
 #include <postgres.h>
+#include "bgw_policy/policies_v2.h"
 #include "cache.h"
 #include <access/xact.h>
 #include <catalog/namespace.h>
@@ -36,6 +37,7 @@
 #include "bgw_policy/continuous_aggregate_api.h"
 #include "bgw_policy/policy_config.h"
 #include "bgw_policy/policy_utils.h"
+#include "bgw_policy/process_hyper_inval_api.h"
 #include "bgw_policy/reorder_api.h"
 #include "bgw_policy/retention_api.h"
 #include "compression/api.h"
@@ -55,6 +57,7 @@
 #include "dimension_slice.h"
 #include "guc.h"
 #include "job.h"
+#include "jsonb_utils.h"
 #include "reorder.h"
 #include "utils.h"
 
@@ -63,23 +66,13 @@
 static void
 log_retention_boundary(int elevel, PolicyRetentionData *policy_data, const char *message)
 {
-	char *relname;
-	Datum boundary;
-	Oid outfuncid = InvalidOid;
-	bool isvarlena;
-
-	getTypeOutputInfo(policy_data->boundary_type, &outfuncid, &isvarlena);
-
-	relname = get_rel_name(policy_data->object_relid);
-	boundary = policy_data->boundary;
-
-	if (OidIsValid(outfuncid))
+	if (OidIsValid(policy_data->boundary_type))
 		elog(elevel,
 			 "%s \"%s\": dropping data %s %s",
 			 message,
-			 relname,
+			 get_rel_name(policy_data->object_relid),
 			 policy_data->use_creation_time ? "created before" : "older than",
-			 DatumGetCString(OidFunctionCall1(outfuncid, boundary)));
+			 ts_datum_to_string(policy_data->boundary, policy_data->boundary_type));
 }
 
 static void
@@ -314,7 +307,7 @@ policy_retention_read_and_validate_config(Jsonb *config, PolicyRetentionData *po
 	Cache *hcache;
 	const Dimension *open_dim;
 	Datum boundary;
-	Datum boundary_type;
+	Oid boundary_type;
 	ContinuousAgg *cagg;
 	Interval *(*interval_getter)(const Jsonb *);
 	interval_getter = policy_retention_get_drop_after_interval;
@@ -379,6 +372,7 @@ policy_refresh_cagg_execute(int32 job_id, Jsonb *config)
 	JsonbToCStringIndent(str, &config->root, VARSIZE(config));
 
 	policy_refresh_cagg_read_and_validate_config(config, &policy_data);
+	bool extend_last_bucket = !policy_refresh_cagg_check_if_last_policy(&policy_data);
 
 	bool enable_osm_reads_old = ts_guc_enable_osm_reads;
 
@@ -422,7 +416,10 @@ policy_refresh_cagg_execute(int32 job_id, Jsonb *config)
 										context,
 										refresh_window->start_isnull,
 										refresh_window->end_isnull,
-										false);
+										(context.callctx != CAGG_REFRESH_POLICY_BATCHED),
+										false, /* force */
+										policy_data.process_hypertable_invalidations,
+										extend_last_bucket);
 		if (processing_batch >= policy_data.max_batches_per_execution &&
 			processing_batch < context.number_of_batches &&
 			policy_data.max_batches_per_execution > 0)
@@ -508,6 +505,11 @@ policy_refresh_cagg_read_and_validate_config(Jsonb *config, PolicyContinuousAggD
 
 	refresh_newest_first = policy_refresh_cagg_get_refresh_newest_first(config);
 
+	bool process_hypertable_invalidations_found;
+	bool process_hypertable_invalidations =
+		ts_jsonb_get_bool_field(config,
+								POL_REFRESH_CONF_KEY_PROCESS_HYPERTABLE_INVALIDATIONS,
+								&process_hypertable_invalidations_found);
 	if (policy_data)
 	{
 		policy_data->refresh_window.type = dim_type;
@@ -521,6 +523,8 @@ policy_refresh_cagg_read_and_validate_config(Jsonb *config, PolicyContinuousAggD
 		policy_data->buckets_per_batch = buckets_per_batch;
 		policy_data->max_batches_per_execution = max_batches_per_execution;
 		policy_data->refresh_newest_first = refresh_newest_first;
+		policy_data->process_hypertable_invalidations =
+			!process_hypertable_invalidations_found || process_hypertable_invalidations;
 	}
 }
 
